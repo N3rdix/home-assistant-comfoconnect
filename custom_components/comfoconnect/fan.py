@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from aiocomfoconnect.const import VentilationMode, VentilationSpeed
+from aiocomfoconnect.exceptions import AioComfoConnectNotConnected, ComfoConnectRmiError
 from aiocomfoconnect.sensors import (
     SENSOR_FAN_SPEED_MODE,
     SENSOR_OPERATING_MODE,
@@ -13,7 +14,8 @@ from aiocomfoconnect.sensors import (
 )
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -22,7 +24,12 @@ from homeassistant.util.percentage import (
     percentage_to_ordered_list_item,
 )
 
-from . import DOMAIN, SIGNAL_COMFOCONNECT_UPDATE_RECEIVED, ComfoConnectBridge
+from . import (
+    DOMAIN,
+    SIGNAL_COMFOCONNECT_AVAILABILITY,
+    SIGNAL_COMFOCONNECT_UPDATE_RECEIVED,
+    ComfoConnectBridge,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +72,7 @@ class ComfoConnectFan(FanEntity):
         self._ccb = ccb
         self._attr_unique_id = self._ccb.uuid
         self._attr_preset_mode = None
+        self._attr_available = ccb.is_available
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._ccb.uuid)},
         )
@@ -90,7 +98,23 @@ class ComfoConnectFan(FanEntity):
             )
         )
         await self._ccb.register_sensor(SENSORS.get(SENSOR_OPERATING_MODE))
+        self._attr_preset_mode = await self._ccb.get_mode()
 
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_COMFOCONNECT_AVAILABILITY.format(self._ccb.uuid),
+                self._handle_availability_update,
+            )
+        )
+
+    @callback
+    def _handle_availability_update(self, available: bool) -> None:
+        """Handle bridge availability changes."""
+        self._attr_available = available
+        self.async_write_ha_state()
+
+    @callback
     def _handle_speed_update(self, value: int) -> None:
         """Handle update callbacks."""
         _LOGGER.debug("Handle update for fan speed (%d): %s", SENSOR_FAN_SPEED_MODE, value)
@@ -99,8 +123,9 @@ class ComfoConnectFan(FanEntity):
         else:
             self._attr_percentage = ordered_list_item_to_percentage(FAN_SPEEDS, FAN_SPEED_MAPPING[value])
 
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
+    @callback
     def _handle_mode_update(self, value: int) -> None:
         """Handle update callbacks."""
         _LOGGER.debug(
@@ -109,7 +134,7 @@ class ComfoConnectFan(FanEntity):
             value,
         )
         self._attr_preset_mode = VentilationMode.AUTO if value == -1 else VentilationMode.MANUAL
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool | None:
@@ -145,7 +170,12 @@ class ComfoConnectFan(FanEntity):
         else:
             speed = percentage_to_ordered_list_item(FAN_SPEEDS, percentage)
 
-        await self._ccb.set_speed(speed)
+        try:
+            await self._ccb.set_speed(speed)
+        except AioComfoConnectNotConnected as err:
+            raise HomeAssistantError(f"Not connected to ComfoConnect bridge: {err}") from err
+        except ComfoConnectRmiError as err:
+            raise HomeAssistantError(f"Failed to set fan speed: {err}") from err
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
@@ -153,4 +183,9 @@ class ComfoConnectFan(FanEntity):
             raise ValueError(f"Invalid preset mode: {preset_mode}")
 
         _LOGGER.debug("Changing preset mode to %s", preset_mode)
-        await self._ccb.set_mode(preset_mode)
+        try:
+            await self._ccb.set_mode(preset_mode)
+        except AioComfoConnectNotConnected as err:
+            raise HomeAssistantError(f"Not connected to ComfoConnect bridge: {err}") from err
+        except ComfoConnectRmiError as err:
+            raise HomeAssistantError(f"Failed to set preset mode: {err}") from err
